@@ -65,8 +65,8 @@ function projectPath(owner, name) {
  * hunks; the `diff --git` header, mode, rename and `---`/`+++` lines are
  * rebuilt from its flags so the comparison view reads GitLab like GitHub. A
  * file GitLab sends without hunks (binary, or too large to diff) keeps its
- * header alone, the way git shows a metadata-only change; one it collapsed
- * comes from `raw_diffs` instead when that can be read.
+ * header alone, the way git shows a metadata-only change. A file it
+ * collapsed is read from `raw_diffs` when that endpoint answers.
  */
 function gitPatchForDiff(file) {
   const oldPath = text(file.old_path) || file.new_path;
@@ -540,10 +540,11 @@ export function createGitLabResourceService({ origin, client, download, resolveP
     if (!isPlainObject(raw) || !Number.isInteger(raw.id)) throw new Error('GitLab returned an invalid note');
   };
 
-  // The merge request's whole `git diff`, uncollapsed, from `raw_diffs`
-  // (GitLab 17.9+; GitBeaker has no method for it). Read only when the diff
-  // list collapsed a file. On an older GitLab, or any failure but a refused
-  // token, the collapsed files keep the header-only patch they had before.
+  // The merge request's whole `git diff` from `raw_diffs`, which GitLab 17.9
+  // added and which collapses nothing. GitBeaker has no method for it. Read
+  // only when the diff list collapsed a file. On an older GitLab, or any
+  // failure but a refused token, the collapsed files keep their header-only
+  // patch, as before.
   const readRawDiffSections = async (projectId, number) => {
     try {
       const response = await client.MergeRequests.requester.get(`projects/${encodeURIComponent(projectId)}/merge_requests/${number}/raw_diffs`);
