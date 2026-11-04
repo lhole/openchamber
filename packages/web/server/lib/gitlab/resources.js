@@ -65,12 +65,13 @@ function projectPath(owner, name) {
  * hunks; the `diff --git` header, mode, rename and `---`/`+++` lines are
  * rebuilt from its flags so the comparison view reads GitLab like GitHub. A
  * file GitLab sends without hunks (binary, or too large to diff) keeps its
- * header alone, the way git shows a metadata-only change.
+ * header alone, the way git shows a metadata-only change; one it collapsed
+ * comes from `raw_diffs` instead when that can be read.
  */
 function gitPatchForDiff(file) {
   const oldPath = text(file.old_path) || file.new_path;
   const newPath = text(file.new_path) || file.old_path;
-  const lines = [`diff --git a/${oldPath} b/${newPath}`];
+  const lines = [gitHeaderForDiff(file)];
   if (file.new_file === true) lines.push(`new file mode ${text(file.b_mode) || '100644'}`);
   else if (file.deleted_file === true) lines.push(`deleted file mode ${text(file.a_mode) || '100644'}`);
   else if (text(file.a_mode) && text(file.b_mode) && file.a_mode !== file.b_mode) lines.push(`old mode ${file.a_mode}`, `new mode ${file.b_mode}`);
@@ -83,6 +84,27 @@ function gitPatchForDiff(file) {
   const header = `${lines.join('\n')}\n`;
   if (!body) return header;
   return `${header}${body.endsWith('\n') ? body : `${body}\n`}`;
+}
+
+/** A file's `diff --git` line, as `gitPatchForDiff` writes it and as `raw_diffs` names the file. */
+function gitHeaderForDiff(file) {
+  const oldPath = text(file.old_path) || file.new_path;
+  const newPath = text(file.new_path) || file.old_path;
+  return `diff --git a/${oldPath} b/${newPath}`;
+}
+
+/** GitLab withheld the hunks only to stay in its diff budget; they "can be fetched on request". */
+const isCollapsedDiff = (file) => file.collapsed === true && file.too_large !== true && !(isString(file.diff) && file.diff);
+
+/** A raw `git diff` cut into its files, keyed by each file's `diff --git` line. */
+function rawDiffSections(raw) {
+  const sections = new Map();
+  for (const section of raw.split(/(?=^diff --git )/m)) {
+    if (!section.startsWith('diff --git ')) continue;
+    const [header] = section.split('\n', 1);
+    sections.set(header, section.endsWith('\n') ? section : `${section}\n`);
+  }
+  return sections;
 }
 
 // How many merge requests and issues one live-state read asks GitLab about at
@@ -516,6 +538,21 @@ export function createGitLabResourceService({ origin, client, download, resolveP
   const postNote = async (create) => {
     const raw = await create();
     if (!isPlainObject(raw) || !Number.isInteger(raw.id)) throw new Error('GitLab returned an invalid note');
+  };
+
+  // The merge request's whole `git diff`, uncollapsed, from `raw_diffs`
+  // (GitLab 17.9+; GitBeaker has no method for it). Read only when the diff
+  // list collapsed a file. On an older GitLab, or any failure but a refused
+  // token, the collapsed files keep the header-only patch they had before.
+  const readRawDiffSections = async (projectId, number) => {
+    try {
+      const response = await client.MergeRequests.requester.get(`projects/${encodeURIComponent(projectId)}/merge_requests/${number}/raw_diffs`);
+      const body = response?.body instanceof Blob ? await response.body.text() : response?.body;
+      return isString(body) ? rawDiffSections(body) : null;
+    } catch (error) {
+      if (upstreamStatusOf(error) === 401) throw error;
+      return null;
+    }
   };
 
   // Requesting changes exists only in GitLab's GraphQL API. The path is
@@ -1316,8 +1353,9 @@ export function createGitLabResourceService({ origin, client, download, resolveP
       if (!Array.isArray(diffs)) throw new Error('GitLab returned an invalid merge request diff list');
       const files = diffs.filter((diff) => isPlainObject(diff) && (text(diff.new_path) || text(diff.old_path)));
       if (files.length !== diffs.length) throw new Error('GitLab returned an invalid merge request diff');
+      const expanded = files.some(isCollapsedDiff) ? await readRawDiffSections(target.project.id, number) : null;
       return {
-        patch: files.map(gitPatchForDiff).join(''),
+        patch: files.map((file) => (isCollapsedDiff(file) && expanded?.get(gitHeaderForDiff(file))) || gitPatchForDiff(file)).join(''),
         meta: { owner: target.project.owner, repo: target.project.name, number },
       };
     },

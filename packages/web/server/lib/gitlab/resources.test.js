@@ -950,6 +950,42 @@ describe('GitLab merge request comparison reads', () => {
     expect(client.MergeRequests.allDiffs).toHaveBeenCalledWith('2', 5, expect.objectContaining({ showExpanded: true, perPage: 30, maxPages: 67 }));
   });
 
+  it('fills a file GitLab collapsed from the raw diff and leaves a too-large one as its header', async () => {
+    const collapsed = { old_path: 'big.py', new_path: 'big.py', new_file: true, a_mode: '0', b_mode: '100644', diff: '', collapsed: true, too_large: false };
+    const tooLarge = { old_path: 'huge.json', new_path: 'huge.json', a_mode: '100644', b_mode: '100644', diff: '', collapsed: true, too_large: true };
+    const raw = [
+      'diff --git a/a.ts b/a.ts', 'index 1111111..2222222 100644', '--- a/a.ts', '+++ b/a.ts', '@@ -1 +1 @@', '-old', '+new',
+      'diff --git a/big.py b/big.py', 'new file mode 100644', 'index 0000000..3333333', '--- /dev/null', '+++ b/big.py', '@@ -0,0 +1,2 @@', '+one', '+two',
+      'diff --git a/huge.json b/huge.json', 'index 4444444..5555555 100644', '--- a/huge.json', '+++ b/huge.json', '@@ -1 +1 @@', '-{}', '+[]',
+    ].join('\n');
+    const get = vi.fn(async () => ({ body: raw, headers: {}, status: 200 }));
+    const allDiffs = list([{ old_path: 'a.ts', new_path: 'a.ts', a_mode: '100644', b_mode: '100644', diff: '@@ -1 +1 @@\n-old\n+new\n' }, collapsed, tooLarge]);
+    const { service } = setup({ MergeRequests: { ...setup().client.MergeRequests, allDiffs, requester: { get } } });
+
+    const { patch } = await service.changeRequestPatch('/repo', 5, { project: { owner: 'team', name: 'repo' }, remote: 'origin' });
+    expect(get).toHaveBeenCalledWith('projects/2/merge_requests/5/raw_diffs');
+    expect(patch).toBe([
+      'diff --git a/a.ts b/a.ts', '--- a/a.ts', '+++ b/a.ts', '@@ -1 +1 @@', '-old', '+new',
+      'diff --git a/big.py b/big.py', 'new file mode 100644', 'index 0000000..3333333', '--- /dev/null', '+++ b/big.py', '@@ -0,0 +1,2 @@', '+one', '+two',
+      // GitLab says a too-large diff "cannot be retrieved", so it is not taken from the raw diff either.
+      'diff --git a/huge.json b/huge.json',
+      '',
+    ].join('\n'));
+  });
+
+  it('keeps a collapsed file as its header when GitLab has no raw diff endpoint', async () => {
+    const collapsed = { old_path: 'big.py', new_path: 'big.py', a_mode: '100644', b_mode: '100644', diff: '', collapsed: true, too_large: false };
+    const get = vi.fn(async () => { throw Object.assign(new Error('404 Not Found'), { cause: { response: { status: 404 } } }); });
+    const { service } = setup({ MergeRequests: { ...setup().client.MergeRequests, allDiffs: list([collapsed]), requester: { get } } });
+
+    await expect(service.changeRequestPatch('/repo', 5, { project: { owner: 'team', name: 'repo' }, remote: 'origin' }))
+      .resolves.toMatchObject({ patch: 'diff --git a/big.py b/big.py\n' });
+
+    get.mockImplementation(async () => { throw Object.assign(new Error('401 Unauthorized'), { cause: { response: { status: 401 } } }); });
+    await expect(service.changeRequestPatch('/repo', 5, { project: { owner: 'team', name: 'repo' }, remote: 'origin' }))
+      .rejects.toThrow('401 Unauthorized');
+  });
+
   it('reads both sides of a file at the merge base and the head', async () => {
     const showRaw = vi.fn(async (_project, path, ref) => `${path}@${ref.slice(0, 1)}`);
     const { service } = setup({
